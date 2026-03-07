@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: outreachai-server
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GOBII_KEY
+        value: jsi12Ryzv4EGJAPshgDPjhYzJUbzFBDoedCx17rTvGk
+      - key: GOBII_AGENT_ID
+        value: 4fbf39a7-63de-4f61-b59c-80c446298205
+      - key: INSTANTLY_KEY
+        value: f12hxp884wmd6akz07fecdfg7jc1
+      - key: INSTANTLY_CAMP
+        value: 17b493f6-83fc-4acc-944c-96c8878a581b
+      - key: SENDER_NAME
+        value: Abdiel
+      - key: CALENDAR_LINK
+        value: calendly.com/yourlink
+      - key: POLL_INTERVAL_MS
+        value: "120000"
+      - key: CLAUDE_KEY
+        value: YOUR_CLAUDE_API_KEY_HERE
