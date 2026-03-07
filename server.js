@@ -19,7 +19,7 @@ function sleep(ms) {
 }
 
 function normalizeBaseUrl(url, fallback) {
-  const raw = (url || fallback || '').trim();
+  const raw = String(url || fallback || '').trim();
   if (!raw) return '';
   return raw.replace(/\/+$/, '');
 }
@@ -184,7 +184,6 @@ Find at least 10 fresh leads not previously found. Return ONLY valid JSON array.
 
     log(`📋 Gobii task started: ${taskId}`);
 
-    // Poll for result up to ~2 minutes
     for (let i = 0; i < 24; i++) {
       await sleep(5000);
 
@@ -250,16 +249,8 @@ function parseLeads(raw) {
   return arr
     .filter((l) => l && (l.email || l.firstName || l.name))
     .map((l) => ({
-      firstName:
-        l.firstName ||
-        l.first_name ||
-        (l.name || '').split(' ')[0] ||
-        '',
-      lastName:
-        l.lastName ||
-        l.last_name ||
-        (l.name || '').split(' ').slice(1).join(' ') ||
-        '',
+      firstName: l.firstName || l.first_name || (l.name || '').split(' ')[0] || '',
+      lastName: l.lastName || l.last_name || (l.name || '').split(' ').slice(1).join(' ') || '',
       email: (l.email || l.email_address || '').toLowerCase().trim(),
       company: l.company || l.company_name || l.organization || '',
       title: l.title || l.job_title || '',
@@ -316,13 +307,6 @@ async function pushToInstantly(leads) {
     });
 
     const text = await r.text();
-    let d;
-    try {
-      d = JSON.parse(text);
-    } catch {
-      d = { raw: text };
-    }
-
     if (r.ok) {
       state.stats.pushed += leads.length;
       log(`✅ ${leads.length} leads pushed to Instantly`);
@@ -348,7 +332,6 @@ async function fetchInstantlyReplies() {
     )}&campaign_id=${encodeURIComponent(CONFIG.INSTANTLY_CAMP)}&limit=20`;
 
     const r = await fetch(url);
-
     if (!r.ok) {
       const text = await r.text();
       log(`Instantly reply fetch error: ${r.status} — ${text}`, 'error');
@@ -454,16 +437,16 @@ async function classifyReply(replyText) {
       return { classification: 'Out of Office', confidence: 0.95, reasoning: 'OOO pattern detected' };
     }
     if (/wrong person|not my department|don\'t handle/.test(t)) {
-      return { classification: 'Wrong Person', confidence: 0.90, reasoning: 'Wrong contact' };
+      return { classification: 'Wrong Person', confidence: 0.9, reasoning: 'Wrong contact' };
     }
     if (/not now|maybe later|next quarter|too busy/.test(t)) {
-      return { classification: 'Not Now', confidence: 0.80, reasoning: 'Timing objection' };
+      return { classification: 'Not Now', confidence: 0.8, reasoning: 'Timing objection' };
     }
     if (/tell me more|how does|what does|interested|open to|sure|sounds good|yes/.test(t)) {
       return { classification: 'Interested', confidence: 0.85, reasoning: 'Positive signal' };
     }
 
-    return { classification: 'Not Interested', confidence: 0.50, reasoning: 'No clear signal' };
+    return { classification: 'Not Interested', confidence: 0.5, reasoning: 'No clear signal' };
   }
 
   try {
@@ -648,7 +631,6 @@ async function startWorkers() {
     setTimeout(runReplies, CONFIG.POLL_INTERVAL_MS);
   };
 
-  // Start after a short warmup
   setTimeout(runLeads, 5000);
   setTimeout(runReplies, 8000);
 }
@@ -657,7 +639,6 @@ async function startWorkers() {
 //  API ROUTES
 // ════════════════════════════════════════════════════════════
 
-// Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -670,7 +651,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// Full state
 app.get('/api/state', (req, res) => {
   res.json({
     leads: state.leads.slice(0, 200),
@@ -683,7 +663,6 @@ app.get('/api/state', (req, res) => {
   });
 });
 
-// Gobii test
 app.get('/api/gobii/test', async (req, res) => {
   log('Testing Gobii connection…');
 
@@ -701,4 +680,139 @@ app.get('/api/gobii/test', async (req, res) => {
       });
     }
 
-    log(`Gobii
+    log(`Gobii test failed: ${result.status} — ${JSON.stringify(result.data)}`, 'error');
+    return res.status(result.status).json({
+      ok: false,
+      status: result.status,
+      data: result.data,
+      agentId: CONFIG.GOBII_AGENT_ID,
+      baseUrl: result.url,
+    });
+  } catch (e) {
+    log(`Gobii test error: ${e.message}`, 'error');
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/instantly/test', async (req, res) => {
+  const result = await testInstantlyConnection();
+  res.status(result.ok ? 200 : result.status).json(result);
+});
+
+app.post('/api/gobii/fetch-now', async (req, res) => {
+  const leads = await fetchGobiiLeads();
+  state.lastGobiiPoll = new Date().toISOString();
+  state.stats.leadsFound += leads.length;
+  return res.json({ ok: true, count: leads.length, leads });
+});
+
+app.post('/api/instantly/push-now', async (req, res) => {
+  const leads = req.body?.leads || [];
+  if (!Array.isArray(leads) || !leads.length) {
+    return res.json({ ok: false, message: 'No leads' });
+  }
+
+  await pushToInstantly(leads);
+  state.leads.push(...leads);
+  state.stats.imported += leads.length;
+  return res.json({ ok: true, pushed: leads.length });
+});
+
+app.post('/api/replies/check-now', async (req, res) => {
+  await runReplyWorker();
+  return res.json({ ok: true, stats: state.stats, lastReplyPoll: state.lastReplyPoll });
+});
+
+app.post('/api/auto-reply/toggle', (req, res) => {
+  state.autoReplyEnabled = !!req.body?.enabled;
+  return res.json({ ok: true, enabled: state.autoReplyEnabled });
+});
+
+app.post('/api/unblock', (req, res) => {
+  const { email } = req.body || {};
+  state.blockedEmails = state.blockedEmails.filter((e) => e !== email);
+  return res.json({ ok: true });
+});
+
+app.post('/api/log/clear', (req, res) => {
+  state.log = [];
+  return res.json({ ok: true });
+});
+
+app.get('/api/proxy/gobii/*', async (req, res) => {
+  try {
+    const path = req.params[0];
+    const r = await fetch(joinUrl(GOBII_BASE, path), {
+      headers: gobiiHeaders(),
+    });
+    const text = await r.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+    return res.status(r.status).json(data);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.all('/api/proxy/instantly/*', async (req, res) => {
+  try {
+    const path = req.params[0];
+    const r = await fetch(joinUrl(INSTANTLY_BASE, path), {
+      method: req.method,
+      headers: { 'Content-Type': 'application/json' },
+      body: req.method !== 'GET' ? JSON.stringify(req.body) : undefined,
+    });
+    const text = await r.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+    return res.status(r.status).json(data);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/gobii/discover', async (req, res) => {
+  const candidates = [
+    'https://gobii.ai/api/v1',
+    'https://gobii.ai/api',
+    'https://gobii.ai/v1',
+    'https://app.gobii.ai/api/v1',
+    'https://app.gobii.ai/api',
+  ];
+
+  const results = [];
+  for (const base of candidates) {
+    try {
+      const r = await fetch(joinUrl(base, 'persistent-agents/'), {
+        headers: gobiiHeaders(),
+      });
+      results.push({ base, status: r.status, ok: r.ok });
+      if (r.ok) {
+        results[results.length - 1].winner = true;
+        break;
+      }
+    } catch (e) {
+      results.push({ base, error: e.message });
+    }
+  }
+
+  const winner = results.find((r) => r.ok);
+  return res.json({ winner: winner?.base || null, results });
+});
+
+// ════════════════════════════════════════════════════════════
+//  START
+// ════════════════════════════════════════════════════════════
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  log(`OutreachAI server running on port ${PORT}`);
+  startWorkers();
+});
