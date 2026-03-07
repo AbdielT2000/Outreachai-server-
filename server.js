@@ -14,7 +14,7 @@ app.use(express.json());
 
 // ── Config from environment variables (set in Render dashboard)
 const CONFIG = {
-  GOBII_KEY:        process.env.GOBII_KEY        || 'jsi12Ryzv4EGJAPshgDPjhYzJUbzFBDoedCx17rTvGk',
+  GOBII_KEY:        process.env.GOBII_API_KEY || process.env.GOBII_KEY || 'jsi12Ryzv4EGJAPshgDPjhYzJUbzFBDoedCx17rTvGk',
   GOBII_AGENT_ID:   process.env.GOBII_AGENT_ID   || '4fbf39a7-63de-4f61-b59c-80c446298205',
   INSTANTLY_KEY:    process.env.INSTANTLY_KEY    || 'f12hxp884wmd6akz07fecdfg7jc1',
   INSTANTLY_CAMP:   process.env.INSTANTLY_CAMP   || '17b493f6-83fc-4acc-944c-96c8878a581b',
@@ -24,7 +24,7 @@ const CONFIG = {
   POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS || '120000'), // 2 min default
 };
 
-const GOBII_BASE    = 'https://api.gobii.ai/v1';
+const GOBII_BASE    = process.env.GOBII_BASE_URL || 'https://gobii.ai/api/v1';
 const INSTANTLY_BASE = 'https://api.instantly.ai/api/v1';
 
 // ── In-memory state (persists while server runs)
@@ -56,7 +56,7 @@ async function fetchGobiiLeads() {
     // Trigger a new task on the agent
     const taskResp = await fetch(`${GOBII_BASE}/tasks/browser-use/`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.GOBII_KEY}` },
+      headers: { 'X-Api-Key': CONFIG.GOBII_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         agent_id: CONFIG.GOBII_AGENT_ID,
         task: `Search for marketing agencies with 2-10 employees. Find owner or CEO contacts.
@@ -93,7 +93,7 @@ Find at least 10 fresh leads not previously found. Return ONLY valid JSON array.
     for (let i = 0; i < 24; i++) {
       await sleep(5000);
       const r = await fetch(`${GOBII_BASE}/tasks/browser-use/${taskId}/`, {
-        headers: { 'Authorization': `Bearer ${CONFIG.GOBII_KEY}` }
+        headers: { 'X-Api-Key': CONFIG.GOBII_KEY, 'Content-Type': 'application/json' }
       });
       if (!r.ok) continue;
       const d = await r.json();
@@ -417,6 +417,35 @@ app.get('/api/state', (req, res) => {
   });
 });
 
+// Gobii: Test connection (proxied server-side — avoids CORS)
+app.get('/api/gobii/test', async (req, res) => {
+  log('Testing Gobii connection…');
+  try {
+    const r = await fetch(`${GOBII_BASE}/persistent-agents/`, {
+      headers: { 'X-Api-Key': CONFIG.GOBII_KEY, 'Content-Type': 'application/json' }
+    });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch(e) { data = { raw: text }; }
+    if (r.ok) {
+      log(`✅ Gobii connected — ${JSON.stringify(data).slice(0,100)}`);
+      res.json({ ok: true, status: r.status, data, agentId: CONFIG.GOBII_AGENT_ID, baseUrl: GOBII_BASE });
+    } else {
+      log(`Gobii test failed: ${r.status} — ${text}`, 'error');
+      res.status(r.status).json({ ok: false, status: r.status, error: text, baseUrl: GOBII_BASE });
+    }
+  } catch(e) {
+    log(`Gobii test error: ${e.message}`, 'error');
+    res.status(500).json({ ok: false, error: e.message, baseUrl: GOBII_BASE });
+  }
+});
+
+// Gobii: Trigger lead fetch now (proxied server-side — avoids CORS)
+app.post('/api/gobii/run', async (req, res) => {
+  res.json({ ok: true, message: 'Gobii lead fetch started server-side' });
+  runLeadWorker().catch(e => log('Gobii run error: ' + e.message, 'error'));
+});
+
 // Trigger lead pull now
 app.post('/api/leads/fetch', async (req, res) => {
   res.json({ ok: true, message: 'Lead worker started' });
@@ -451,7 +480,7 @@ app.get('/api/proxy/gobii/*', async (req, res) => {
   try {
     const path = req.params[0];
     const r = await fetch(`${GOBII_BASE}/${path}`, {
-      headers: { 'Authorization': `Bearer ${CONFIG.GOBII_KEY}` }
+      headers: { 'X-Api-Key': CONFIG.GOBII_KEY, 'Content-Type': 'application/json' }
     });
     const d = await r.json();
     res.status(r.status).json(d);
@@ -492,4 +521,30 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`OutreachAI server running on port ${PORT}`);
   startWorkers();
+});
+
+// ── Gobii URL discovery — tries multiple known endpoints
+app.get('/api/gobii/discover', async (req, res) => {
+  const candidates = [
+    'https://gobii.ai/api/v1',
+    'https://gobii.ai/api',
+    'https://gobii.ai/v1',
+    'https://app.gobii.ai/api/v1',
+    'https://app.gobii.ai/api',
+  ];
+  const results = [];
+  for (const base of candidates) {
+    try {
+      const r = await fetch(`${base}/persistent-agents/`, {
+        headers: { 'X-Api-Key': CONFIG.GOBII_KEY, 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(5000)
+      });
+      results.push({ base, status: r.status, ok: r.ok });
+      if (r.ok) { results[results.length-1].winner = true; break; }
+    } catch(e) {
+      results.push({ base, error: e.message });
+    }
+  }
+  const winner = results.find(r => r.ok);
+  res.json({ winner: winner?.base || null, results });
 });
