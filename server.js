@@ -64,25 +64,26 @@ async function fetchApolloLeads(page = 1) {
   log(`🔍 Searching Apollo (page ${page})…`);
   try {
     const body = {
-      api_key:              CONFIG.APOLLO_KEY,
       page,
       per_page:             25,
       person_titles:        CONFIG.APOLLO_TITLES,
-      organization_industry_tag_ids: [],  // populated below if needed
       organization_num_employees_ranges: [`${CONFIG.APOLLO_MIN_EMP},${CONFIG.APOLLO_MAX_EMP}`],
       contact_email_status: ['verified', 'guessed'],
-      prospected_by_current_team: ['no'],  // only new leads
+      prospected_by_current_team: ['no'],
     };
 
-    // Add industry keyword search
     if (CONFIG.APOLLO_INDUSTRY) {
       body.q_organization_keyword_tags = [CONFIG.APOLLO_INDUSTRY];
     }
 
     const r = await fetch(`${APOLLO_BASE}/mixed_people/search`, {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
-      body:    JSON.stringify(body),
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'X-Api-Key': CONFIG.APOLLO_KEY,
+      },
+      body: JSON.stringify(body),
     });
 
     if (!r.ok) {
@@ -436,9 +437,9 @@ app.get('/api/apollo/test', async (req, res) => {
   if (!CONFIG.APOLLO_KEY) return res.status(400).json({ ok: false, error: 'APOLLO_API_KEY not set in environment' });
   try {
     const r = await fetch(`${APOLLO_BASE}/auth/health`, {
-      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'X-Api-Key': CONFIG.APOLLO_KEY },
       method: 'POST',
-      body: JSON.stringify({ api_key: CONFIG.APOLLO_KEY }),
+      body: JSON.stringify({}),
     });
     const d = await r.json();
     if (r.ok && (d.is_logged_in || d.user)) {
@@ -449,7 +450,8 @@ app.get('/api/apollo/test', async (req, res) => {
       const sr = await fetch(`${APOLLO_BASE}/mixed_people/search`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ api_key: CONFIG.APOLLO_KEY, per_page: 1, page: 1 }),
+        headers: { 'Content-Type': 'application/json', 'X-Api-Key': CONFIG.APOLLO_KEY },
+        body:    JSON.stringify({ per_page: 1, page: 1 }),
       });
       const sd = await sr.json();
       if (sr.ok) {
