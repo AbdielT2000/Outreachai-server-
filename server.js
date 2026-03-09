@@ -58,7 +58,7 @@ async function apolloSearch(page = 1) {
   log(`🔍 Apollo search page ${page}…`);
   const body = {
     page,
-    per_page: 25,
+    per_page: 100,
     person_titles: ['founder', 'owner', 'ceo', 'co-founder', 'managing director'],
     organization_num_employees_ranges: ['1,50'],
     q_organization_keyword_tags: ['marketing', 'advertising'],
