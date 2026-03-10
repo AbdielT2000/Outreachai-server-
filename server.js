@@ -565,6 +565,63 @@ app.post('/api/unblock', (req, res) => {
 // ── Clear logs
 app.post('/api/log/clear', (req, res) => { state.log = []; res.json({ ok: true }); });
 
+
+// ════════════════════════════════════════════════════════════
+//  CSV IMPORT ROUTES
+// ════════════════════════════════════════════════════════════
+
+// Personalize a single lead via Claude
+app.post('/api/personalize', async (req, res) => {
+  const { lead } = req.body || {};
+  if(!lead || !lead.first_name) return res.status(400).json({ ok: false, error: 'lead required' });
+  try {
+    const personalization = await personalizeForLead(lead);
+    res.json({ ok: true, personalization });
+  } catch(e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Push a batch of pre-personalized CSV leads to Instantly
+app.post('/api/csv/push', async (req, res) => {
+  const { leads, instantly_key, campaign_id } = req.body || {};
+  if(!leads || !leads.length) return res.status(400).json({ ok: false, error: 'leads array required' });
+
+  const iKey  = instantly_key  || CONFIG.INSTANTLY_KEY;
+  const iCamp = campaign_id    || CONFIG.INSTANTLY_CAMP;
+
+  // Cap at 2000 per call
+  const batch = leads.slice(0, 2000);
+  log(`[CSV Push] Pushing ${batch.length} leads to Instantly campaign ${iCamp}`);
+
+  try {
+    const r = await fetch(`${INSTANTLY_V1}/lead/add`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key:              iKey,
+        campaign_id:          iCamp,
+        skip_if_in_workspace: true,
+        leads:                batch,
+      }),
+    });
+    const bodyText = await r.text();
+    log(`[CSV Push] Instantly responded ${r.status}: ${bodyText.slice(0,200)}`);
+
+    if(r.ok){
+      state.stats.pushed += batch.length;
+      res.json({ ok: true, pushed: batch.length });
+    } else {
+      let errMsg = bodyText;
+      try { errMsg = JSON.parse(bodyText).error || bodyText; } catch(e) {}
+      res.status(r.status).json({ ok: false, error: errMsg, status: r.status });
+    }
+  } catch(e) {
+    log(`[CSV Push] Exception: ${e.message}`, 'error');
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── 404 catch-all — always JSON, never HTML
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: `Route not found: ${req.method} ${req.path}` });
