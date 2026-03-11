@@ -118,36 +118,101 @@ async function enrichPerson(person) {
 // ════════════════════════════════════════════════════════════
 //  CLAUDE — AI personalization
 // ════════════════════════════════════════════════════════════
-async function personalizeForLead(lead) {
-  if (!CONFIG.CLAUDE_KEY || !lead.website) {
-    return `Hi ${lead.first_name}, noticed you run ${lead.company}.`;
+// Step 1: fetch and clean homepage text
+async function fetchHomepageText(website) {
+  try {
+    let url = website.trim();
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; OutreachBot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+      redirect: 'follow',
+    });
+    if (!r.ok) return null;
+    const html = await r.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .slice(0, 3000);
+    return text || null;
+  } catch (e) {
+    return null;
   }
+}
+
+async function personalizeForLead(lead) {
+  const fallback = `Hi ${lead.first_name}, noticed you run ${lead.company}.`;
+  if (!CONFIG.CLAUDE_KEY) return fallback;
+
+  // Fetch the actual homepage
+  const homepageText = lead.website ? await fetchHomepageText(lead.website) : null;
+
+  const websiteContext = homepageText
+    ? `Homepage content from ${lead.website}:\n"""\n${homepageText}\n"""`
+    : `No website available. Company name: ${lead.company}.`;
+
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         CONFIG.CLAUDE_KEY,
+        'anthropic-version': '2023-06-01',
+      },
       body: JSON.stringify({
         model:      'claude-sonnet-4-20250514',
-        max_tokens: 150,
-        tools:      [{ type: 'web_search_20250305', name: 'web_search' }],
+        max_tokens: 60,
         messages: [{
           role:    'user',
-          content: `Visit ${lead.website} and write ONE short compliment (max 12 words) about ${lead.company} to open a cold email. Be specific — mention their niche, a result, their positioning, or a unique service. Return ONLY the compliment, no punctuation at end, no quotes.`,
+          content: `You are writing the opening line of a cold email to ${lead.first_name} at ${lead.company}.
+
+${websiteContext}
+
+Write ONE short personalized opening line. Rules:
+- Start with "Hi ${lead.first_name},"
+- Mention the company name or what they specifically do based on the homepage
+- Maximum 15 words total (including "Hi ${lead.first_name},")
+- Do NOT say "I checked your website" or "I visited" or "I saw your website"
+- Do NOT use phrases like "I came across" or "I stumbled upon"
+- Be natural and specific — reference their actual niche, service, or focus
+- Return ONLY the one line, no quotes, no trailing punctuation
+
+Examples of the format:
+Hi Aaron, noticed BlueWing Impact focuses on SaaS SEO.
+Hi Andy, saw Thrive CRM helps agencies manage leads.
+Hi Aaman, noticed Scaletopia builds remote development teams.`,
         }],
       }),
+      signal: AbortSignal.timeout(15000),
     });
+
     const d    = await r.json();
-    const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
-    if (text && text.length > 5 && text.length < 120) {
+    const text = (d.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+      .trim()
+      .replace(/^["']|["'.,]$/g, '');
+
+    if (text && text.length > 10 && text.length < 150 && text.startsWith('Hi ')) {
       state.stats.personalized++;
-      log(`✏️ ${lead.first_name} @ ${lead.company}: "${text}"`);
+      log(`✏️  ${lead.first_name} @ ${lead.company}: "${text}"`);
       return text;
     }
   } catch (e) {
     log(`Personalization error for ${lead.company}: ${e.message}`, 'warn');
   }
-  return `Hi ${lead.first_name}, noticed you run ${lead.company}.`;
+
+  return fallback;
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  INSTANTLY — Push leads (V1)
