@@ -120,6 +120,7 @@ async function personalizeForLead(lead) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
+      signal: AbortSignal.timeout(20000),
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 80,
@@ -147,6 +148,7 @@ async function classifyReply(replyText) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
+      signal: AbortSignal.timeout(12000),
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 20,
@@ -172,6 +174,7 @@ async function writeBookingReply(prospectName, prospectCompany, originalMessage,
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
+      signal: AbortSignal.timeout(15000),
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 150,
@@ -381,6 +384,7 @@ app.post('/api/csv/push', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ api_key: iKey, campaign_id: iCamp, skip_if_in_workspace: true, leads: leads.slice(0, 2000) }),
+      signal: AbortSignal.timeout(25000),
     });
     const txt = await r.text();
     if (r.ok) { state.stats.pushed += leads.length; res.json({ ok: true, pushed: leads.length }); }
