@@ -1,44 +1,62 @@
 // ═══════════════════════════════════════════════════════════
-//  OutreachAI Backend Server
-//  Apollo → AI Personalization → Instantly
-//  Runs 24/7 on Render.com
+//  OutreachAI Backend Server — Multi-Campaign Edition
+//  Each campaign has its own sender name + calendar link
+//  so auto-replies go out as the right client
 // ═══════════════════════════════════════════════════════════
 
 const express = require('express');
 const cors    = require('cors');
-const fetch   = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-const app     = express();
+const fs      = require('fs');
+const path    = require('path');
 
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
+const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// ── Config
+// ── Global config (fallback defaults)
 const CONFIG = {
-  APOLLO_KEY:       process.env.APOLLO_API_KEY    || '',
-  INSTANTLY_KEY:    process.env.INSTANTLY_KEY     || 'f12hxp884wmd6akz07fecdfg7jc1',
+  INSTANTLY_KEY:    process.env.INSTANTLY_KEY    || '',
   INSTANTLY_KEY_V2: process.env.INSTANTLY_KEY_V2 || '',
-  INSTANTLY_CAMP:   process.env.INSTANTLY_CAMP    || '17b493f6-83fc-4acc-944c-96c8878a581b',
-  CLAUDE_KEY:       process.env.CLAUDE_KEY        || '',
-  CALENDAR_LINK:    process.env.CALENDAR_LINK     || 'calendly.com/yourlink',
-  SENDER_NAME:      process.env.SENDER_NAME       || 'Abdiel',
-  POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS || '120000'),
+  CLAUDE_KEY:       process.env.CLAUDE_KEY       || '',
+  SENDER_NAME:      process.env.SENDER_NAME      || 'The Team',
+  CALENDAR_LINK:    process.env.CALENDAR_LINK    || '',
+  POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS || '300000'),
 };
 
-const APOLLO_BASE  = 'https://api.apollo.io/api/v1';
-const INSTANTLY_V1 = 'https://api.instantly.ai/api/v1';
-const INSTANTLY_V2 = 'https://api.instantly.ai/api/v2';
+const V1 = 'https://api.instantly.ai/api/v1';
+const V2 = 'https://api.instantly.ai/api/v2';
 
-// ── In-memory state
+// ── Per-campaign config store — persisted to disk so restarts don't wipe data
+// Shape: { [campaignId]: { name, senderName, calendarLink, instantlyKey, campaignId } }
+const CAMPAIGNS_FILE = path.join(__dirname, 'campaigns.json');
+
+function loadCampaigns() {
+  try {
+    if (fs.existsSync(CAMPAIGNS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CAMPAIGNS_FILE, 'utf8'));
+      console.log(`[INFO] Loaded ${Object.keys(data).length} campaigns from disk`);
+      return data;
+    }
+  } catch (e) { console.error('[WARN] Could not load campaigns.json:', e.message); }
+  return {};
+}
+
+function saveCampaignsToDisk() {
+  try { fs.writeFileSync(CAMPAIGNS_FILE, JSON.stringify(campaigns, null, 2)); }
+  catch (e) { console.error('[WARN] Could not save campaigns.json:', e.message); }
+}
+
+let campaigns = loadCampaigns();
+
+// ── State
 let state = {
-  leads:            [],
-  seenReplyIds:     [],
-  blockedEmails:    [],
-  log:              [],
-  stats:            { leadsFound: 0, enriched: 0, pushed: 0, repliesRead: 0, interested: 0, autoSent: 0, unsub: 0, personalized: 0 },
-  lastApolloRun:    null,
-  lastReplyPoll:    null,
-  autoReplyEnabled: true,
-  leadWorkerRunning: false,
+  log:           [],
+  stats:         { personalized: 0, pushed: 0, repliesChecked: 0, autoReplied: 0 },
+  repliedEmails: new Set(),
+  workerRunning: false,
+  lastPoll:      null,
 };
 
 function log(msg, type = 'info') {
@@ -50,75 +68,21 @@ function log(msg, type = 'info') {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ════════════════════════════════════════════════════════════
-//  APOLLO — Search (no credits)
-// ════════════════════════════════════════════════════════════
-async function apolloSearch(page = 1) {
-  log(`🔍 Apollo search page ${page}…`);
-  const body = {
-    page,
-    per_page: 100,
-    person_titles: ['founder', 'owner', 'ceo', 'co-founder', 'managing director'],
-    organization_num_employees_ranges: ['1,50'],
-    q_organization_keyword_tags: ['marketing', 'advertising'],
-    person_locations: ['United States'],
-    contact_email_status: ['verified'],
-  };
-  const r = await fetch(`${APOLLO_BASE}/mixed_people/api_search`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Api-Key': CONFIG.APOLLO_KEY },
-    body:    JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const err = await r.text();
-    throw new Error(`Apollo search ${r.status}: ${err}`);
-  }
-  const data = await r.json();
-  const people = data.people || data.contacts || [];
-  log(`✅ Apollo returned ${people.length} people`);
-  return people;
-}
-
-// ════════════════════════════════════════════════════════════
-//  APOLLO — Enrich (1 credit per person)
-// ════════════════════════════════════════════════════════════
-async function enrichPerson(person) {
-  const body = {
-    first_name:             person.first_name || '',
-    last_name:              person.last_name  || '',
-    organization_name:      person.organization?.name || '',
-    domain:                 person.organization?.primary_domain || '',
-    linkedin_url:           person.linkedin_url || '',
-    reveal_personal_emails: false,
-  };
-  const r = await fetch(`${APOLLO_BASE}/people/match`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Api-Key': CONFIG.APOLLO_KEY },
-    body:    JSON.stringify(body),
-  });
-  if (!r.ok) {
-    log(`Enrich failed ${r.status} for ${person.first_name} ${person.last_name}`, 'warn');
-    return null;
-  }
-  const data  = await r.json();
-  const p     = data.person || data;
-  const email = (p.email || '').toLowerCase().trim();
-  if (!email || email.includes('email_not_unlocked') || !email.includes('@')) return null;
-  const domain = person.organization?.primary_domain || '';
+// Look up which campaign config to use for a given campaign ID
+function getCampaignCfg(campaignId) {
+  if (campaignId && campaigns[campaignId]) return campaigns[campaignId];
+  // fallback to global defaults
   return {
-    first_name: person.first_name || '',
-    last_name:  person.last_name  || '',
-    email,
-    company:    person.organization?.name || '',
-    website:    person.organization?.website_url || (domain ? `https://${domain}` : ''),
-    title:      person.title || '',
+    senderName:   CONFIG.SENDER_NAME,
+    calendarLink: CONFIG.CALENDAR_LINK,
+    instantlyKey: CONFIG.INSTANTLY_KEY,
+    campaignId,
   };
 }
 
 // ════════════════════════════════════════════════════════════
-//  CLAUDE — AI personalization
+//  HOMEPAGE FETCH
 // ════════════════════════════════════════════════════════════
-// Step 1: fetch and clean homepage text
 async function fetchHomepageText(website) {
   try {
     let url = website.trim();
@@ -130,573 +94,329 @@ async function fetchHomepageText(website) {
     });
     if (!r.ok) return null;
     const html = await r.text();
-    const text = html
+    return html
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
       .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
+      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
       .replace(/\s{2,}/g, ' ')
-      .trim()
-      .slice(0, 3000);
-    return text || null;
-  } catch (e) {
-    return null;
-  }
+      .trim().slice(0, 3000) || null;
+  } catch { return null; }
 }
 
+// ════════════════════════════════════════════════════════════
+//  CLAUDE — personalize opener
+// ════════════════════════════════════════════════════════════
 async function personalizeForLead(lead) {
   const fallback = `Hi ${lead.first_name}, noticed you run ${lead.company}.`;
   if (!CONFIG.CLAUDE_KEY) return fallback;
 
-  // Fetch the actual homepage
   const homepageText = lead.website ? await fetchHomepageText(lead.website) : null;
-
-  const websiteContext = homepageText
+  const ctx = homepageText
     ? `Homepage content from ${lead.website}:\n"""\n${homepageText}\n"""`
     : `No website available. Company name: ${lead.company}.`;
 
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method:  'POST',
-      headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         CONFIG.CLAUDE_KEY,
-        'anthropic-version': '2023-06-01',
-      },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
-        max_tokens: 60,
-        messages: [{
-          role:    'user',
-          content: `You are writing the opening line of a cold email to ${lead.first_name} at ${lead.company}.
-
-${websiteContext}
-
-Write ONE short personalized opening line. Rules:
-- Start with "Hi ${lead.first_name},"
-- Mention the company name or what they specifically do based on the homepage
-- Maximum 15 words total (including "Hi ${lead.first_name},")
-- Do NOT say "I checked your website" or "I visited" or "I saw your website"
-- Do NOT use phrases like "I came across" or "I stumbled upon"
-- Be natural and specific — reference their actual niche, service, or focus
-- Return ONLY the one line, no quotes, no trailing punctuation
-
-Examples of the format:
-Hi Aaron, noticed BlueWing Impact focuses on SaaS SEO.
-Hi Andy, saw Thrive CRM helps agencies manage leads.
-Hi Aaman, noticed Scaletopia builds remote development teams.`,
-        }],
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 80,
+        messages: [{ role: 'user', content: `You are writing the opening line of a cold email to ${lead.first_name} at ${lead.company}.\n\n${ctx}\n\nWrite ONE short personalized opening line. Rules:\n- Start with "Hi ${lead.first_name},"\n- Mention what they specifically do\n- Maximum 15 words total\n- Do NOT say "I checked your website" or "I visited"\n- Be specific\n- Return ONLY the one line, no quotes\n\nExamples:\nHi Aaron, noticed BlueWing Impact focuses on SaaS SEO.\nHi Sarah, saw Thrive CRM helps agencies close more deals.` }],
       }),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(20000),
     });
-
-    const d    = await r.json();
-    const text = (d.content || [])
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('')
-      .trim()
-      .replace(/^["']|["'.,]$/g, '');
-
+    const d = await r.json();
+    const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim().replace(/^["']|["'.,]$/g, '');
     if (text && text.length > 10 && text.length < 150 && text.startsWith('Hi ')) {
       state.stats.personalized++;
       log(`✏️  ${lead.first_name} @ ${lead.company}: "${text}"`);
       return text;
     }
-  } catch (e) {
-    log(`Personalization error for ${lead.company}: ${e.message}`, 'warn');
-  }
-
+  } catch (e) { log(`Personalization error: ${e.message}`, 'warn'); }
   return fallback;
 }
 
-
 // ════════════════════════════════════════════════════════════
-//  INSTANTLY — Push leads (V1)
+//  CLAUDE — classify reply
 // ════════════════════════════════════════════════════════════
-async function pushToInstantly(leads) {
-  if (!leads.length) return;
-  const url = `${INSTANTLY_V1}/lead/add`;
-  log(`[Instantly V1] POST ${url} — ${leads.length} leads`);
-  const r = await fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      api_key:              CONFIG.INSTANTLY_KEY,
-      campaign_id:          CONFIG.INSTANTLY_CAMP,
-      skip_if_in_workspace: true,
-      leads: leads.map(l => ({
-        email:            l.email,
-        first_name:       l.first_name,
-        last_name:        l.last_name,
-        company_name:     l.company,
-        personalization:  l.personalization,
-        custom_variables: { title: l.title, website: l.website },
-      })),
-    }),
-  });
-  const d = await r.json();
-  if (r.ok) {
-    state.stats.pushed += leads.length;
-    log(`[Instantly V1] ✅ ${leads.length} leads pushed — status ${r.status}`);
-  } else {
-    log(`[Instantly V1] ❌ error ${r.status}: ${JSON.stringify(d)}`, 'error');
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-//  INSTANTLY — Fetch replies (V2)
-// ════════════════════════════════════════════════════════════
-async function fetchInstantlyReplies() {
-  const key = CONFIG.INSTANTLY_KEY_V2;
-  if (!key) {
-    log('[Instantly V2] INSTANTLY_KEY_V2 not set — reply worker skipped', 'warn');
-    return [];
-  }
-  const url = `${INSTANTLY_V2}/emails?campaign_id=${CONFIG.INSTANTLY_CAMP}&limit=25`;
-  log(`[Instantly V2] GET ${url}`);
-  try {
-    const r        = await fetch(url, { headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' } });
-    const bodyText = await r.text();
-    log(`[Instantly V2] /emails → ${r.status} | ${bodyText.slice(0, 300)}`);
-    if (!r.ok) { log(`[Instantly V2] ❌ ${r.status}: ${bodyText}`, 'error'); return []; }
-    const d      = JSON.parse(bodyText);
-    const emails = d.items || d.data || (Array.isArray(d) ? d : []);
-    const replies = emails.filter(e => e.ue_type === 3);
-    log(`[Instantly V2] ${emails.length} emails, ${replies.length} inbound replies`);
-    return replies.map(e => ({
-      id:         e.id,
-      email_id:   e.id,
-      from_email: e.from_address_email || '',
-      from_name:  (e.from_address_email || '').split('@')[0],
-      body:       e.body?.text || e.body?.html || '',
-      eaccount:   e.eaccount || '',
-    }));
-  } catch (e) {
-    log(`[Instantly V2] ❌ exception: ${e.message}`, 'error');
-    return [];
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-//  INSTANTLY — Send reply (V2)
-// ════════════════════════════════════════════════════════════
-async function sendInstantlyReply(replyToUuid, eaccount, bodyText) {
-  const key = CONFIG.INSTANTLY_KEY_V2;
-  if (!key) { log('[Instantly V2] Cannot send reply — key not set', 'warn'); return false; }
-  const url = `${INSTANTLY_V2}/emails/reply`;
-  log(`[Instantly V2] POST ${url} → ${replyToUuid}`);
-  try {
-    const r = await fetch(url, {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ eaccount, reply_to_uuid: replyToUuid, body: { text: bodyText } }),
-    });
-    const respText = await r.text();
-    log(`[Instantly V2] /emails/reply → ${r.status} | ${respText.slice(0, 150)}`);
-    return r.ok;
-  } catch (e) {
-    log(`[Instantly V2] ❌ send exception: ${e.message}`, 'error');
-    return false;
-  }
-}
-
-async function pauseLeadInInstantly(email) {
-  try {
-    await fetch(`${INSTANTLY_V1}/lead/pause`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ api_key: CONFIG.INSTANTLY_KEY, campaign_id: CONFIG.INSTANTLY_CAMP, email }),
-    });
-  } catch (e) {}
-}
-
-// ════════════════════════════════════════════════════════════
-//  CLAUDE — Classify reply
-// ════════════════════════════════════════════════════════════
-async function classifyReply(text) {
-  if (!CONFIG.CLAUDE_KEY) {
-    const t = text.toLowerCase();
-    if (/unsubscribe|remove me|stop email|opt.?out/.test(t))          return { classification: 'Spam/Unsubscribe', confidence: 0.99 };
-    if (/not interested|no thanks|not for us/.test(t))               return { classification: 'Not Interested',   confidence: 0.85 };
-    if (/out of office|on vacation|away until/.test(t))              return { classification: 'Out of Office',    confidence: 0.95 };
-    if (/wrong person|not my department/.test(t))                    return { classification: 'Wrong Person',     confidence: 0.90 };
-    if (/not now|maybe later|next quarter/.test(t))                  return { classification: 'Not Now',          confidence: 0.80 };
-    if (/tell me more|how does|interested|open to|sure|yes/.test(t)) return { classification: 'Interested',       confidence: 0.85 };
-    return { classification: 'Not Interested', confidence: 0.50 };
-  }
+async function classifyReply(replyText) {
+  if (!CONFIG.CLAUDE_KEY) return 'other';
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514', max_tokens: 150,
-        messages: [{ role: 'user', content: `Classify this cold email reply.\n\nREPLY: "${text}"\n\nCategories: Interested | Not Now | Not Interested | Wrong Person | Out of Office | Spam/Unsubscribe\n\nJSON only: {"classification":"...","confidence":0.00,"reasoning":"one sentence"}` }],
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 20,
+        messages: [{ role: 'user', content: `Classify this cold email reply into exactly one word:\n- interested (wants to learn more, open to a call)\n- not_interested (said no, unsubscribe)\n- question (asked something, not committed)\n- ooo (out of office auto-reply)\n- other\n\nReply:\n"""\n${replyText.slice(0, 800)}\n"""\n\nReturn ONLY one of: interested, not_interested, question, ooo, other` }],
       }),
+      signal: AbortSignal.timeout(12000),
     });
-    const d  = await r.json();
-    const t2 = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-    return JSON.parse(t2.replace(/```json|```/g, '').trim());
-  } catch (e) { return { classification: 'Not Interested', confidence: 0.5 }; }
-}
-
-function buildAutoResponse(classification) {
-  const templates = {
-    'Interested':     `Awesome — happy to show you.\n\nGrab a quick time here:\n${CONFIG.CALENDAR_LINK}\n\n– ${CONFIG.SENDER_NAME}`,
-    'Not Now':        `No worries. What month would work better to circle back?\n\n– ${CONFIG.SENDER_NAME}`,
-    'Not Interested': `All good — appreciate you letting me know.\n\n– ${CONFIG.SENDER_NAME}`,
-    'Wrong Person':   `Got it — who would be the right person to reach out to?\n\n– ${CONFIG.SENDER_NAME}`,
-    'Out of Office':  `Thanks — I'll follow up when you're back.\n\n– ${CONFIG.SENDER_NAME}`,
-  };
-  return templates[classification] || null;
+    const d = await r.json();
+    const result = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim().toLowerCase().split(/\s/)[0];
+    const valid = ['interested', 'not_interested', 'question', 'ooo', 'other'];
+    return valid.includes(result) ? result : 'other';
+  } catch (e) { log(`Classify error: ${e.message}`, 'warn'); return 'other'; }
 }
 
 // ════════════════════════════════════════════════════════════
-//  MAIN WORKERS
+//  CLAUDE — write booking reply AS the client
 // ════════════════════════════════════════════════════════════
-async function runLeadWorker() {
-  if (state.leadWorkerRunning) { log('Lead worker already running — skipping'); return; }
-  state.leadWorkerRunning = true;
-  log('═══ Lead Worker starting ═══');
+async function writeBookingReply(prospectName, prospectCompany, originalMessage, calLink, senderName) {
+  const fallback = `Hey ${prospectName},\n\nGreat to hear from you! Here's a link to book a time:\n\n${calLink}\n\nLooking forward to connecting.\n\n– ${senderName}`;
+  if (!CONFIG.CLAUDE_KEY) return fallback;
 
   try {
-    if (!CONFIG.APOLLO_KEY) { log('No APOLLO_API_KEY — skipping', 'warn'); return; }
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 150,
+        messages: [{ role: 'user', content: `Write a short, warm reply to a cold email prospect who is interested in booking a call.\n\nProspect: ${prospectName} at ${prospectCompany}\nTheir message: "${originalMessage.slice(0, 300)}"\nCalendar link: ${calLink}\nYou are: ${senderName}\n\nRules:\n- 2-4 sentences max\n- Warm but not over-the-top\n- Include the calendar link naturally\n- Sign off with exactly "– ${senderName}"\n- Return ONLY the reply body, no subject line` }],
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const d = await r.json();
+    const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    return text.length > 20 ? text : fallback;
+  } catch (e) { log(`Booking reply error: ${e.message}`, 'warn'); return fallback; }
+}
 
-    let people;
-    try {
-      people = await apolloSearch();
-    } catch (e) {
-      log(`Apollo search failed: ${e.message}`, 'error');
+// ════════════════════════════════════════════════════════════
+//  INSTANTLY V2 — fetch replies for a campaign
+// ════════════════════════════════════════════════════════════
+async function fetchReplies(campaignId) {
+  const key = CONFIG.INSTANTLY_KEY_V2;
+  if (!key) return [];
+  try {
+    const url = `${V2}/emails?limit=100&type=received${campaignId ? `&campaign_id=${campaignId}` : ''}`;
+    const r = await fetch(url, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) { log(`V2 replies fetch ${r.status}`, 'warn'); return []; }
+    const d = await r.json();
+    return d.items || d.data || d || [];
+  } catch (e) { log(`fetchReplies error: ${e.message}`, 'warn'); return []; }
+}
+
+// ════════════════════════════════════════════════════════════
+//  INSTANTLY V2 — send reply into thread
+// ════════════════════════════════════════════════════════════
+async function sendReply(emailId, replyBody) {
+  const key = CONFIG.INSTANTLY_KEY_V2;
+  if (!key) return false;
+  try {
+    const r = await fetch(`${V2}/emails/${emailId}/reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ body: replyBody }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (r.ok) { log(`📤 Auto-reply sent (email ${emailId})`, 'success'); return true; }
+    const txt = await r.text();
+    log(`sendReply ${r.status}: ${txt.slice(0, 120)}`, 'warn');
+    return false;
+  } catch (e) { log(`sendReply error: ${e.message}`, 'warn'); return false; }
+}
+
+// ════════════════════════════════════════════════════════════
+//  REPLY WORKER
+//  Loops all registered campaigns, polls replies, auto-responds
+// ════════════════════════════════════════════════════════════
+async function replyWorker() {
+  if (state.workerRunning) return;
+  state.workerRunning = true;
+  state.lastPoll = new Date().toISOString();
+  log('🔄 Reply worker running…');
+
+  try {
+    // Build list of campaign IDs to check
+    // Always include registered campaigns + the global default campaign
+    const campaignIds = new Set([
+      ...Object.keys(campaigns),
+      CONFIG.INSTANTLY_CAMP,
+    ].filter(Boolean));
+
+    if (!campaignIds.size) {
+      log('No campaigns configured for reply polling', 'warn');
+      state.workerRunning = false;
       return;
     }
 
-    if (!people.length) { log('Apollo returned 0 people'); return; }
-
-    const seenEmails    = new Set(state.leads.map(l => l.email));
-    const seenApolloIds = new Set(state.leads.map(l => l.apolloId).filter(Boolean));
-    const fresh         = people.filter(p => !seenApolloIds.has(p.id));
-    log(`${fresh.length} new people to enrich (${people.length - fresh.length} already seen)`);
-
-    const toEnrich      = fresh.slice(0, 25);
-    const enrichedLeads = [];
-
-    for (const person of toEnrich) {
-      const lead = await enrichPerson(person);
-      if (lead && lead.email && !seenEmails.has(lead.email)) {
-        lead.apolloId = person.id;
-        enrichedLeads.push(lead);
-        seenEmails.add(lead.email);
-        state.stats.enriched++;
-        log(`📧 ${lead.first_name} ${lead.last_name} <${lead.email}> @ ${lead.company}`);
+    for (const campaignId of campaignIds) {
+      const cfg = getCampaignCfg(campaignId);
+      if (!cfg.calendarLink) {
+        log(`Campaign ${campaignId}: no calendar link set, skipping`, 'warn');
+        continue;
       }
-      await sleep(1000);
-    }
 
-    state.stats.leadsFound += enrichedLeads.length;
-    state.lastApolloRun = new Date().toISOString();
-    log(`✅ ${enrichedLeads.length} leads with verified emails`);
+      const replies = await fetchReplies(campaignId);
+      log(`Campaign ${campaignId}: ${replies.length} replies`);
+      state.stats.repliesChecked += replies.length;
 
-    if (!enrichedLeads.length) return;
+      for (const reply of replies) {
+        const emailId   = reply.id || reply.email_id;
+        const fromEmail = (reply.from_address?.email || reply.from_email || reply.from || '').toLowerCase();
+        const fromName  = reply.from_address?.name || reply.from_name || fromEmail.split('@')[0] || 'there';
+        const company   = reply.lead?.company_name || reply.company || '';
+        const bodyText  = reply.body?.text || reply.body || reply.text_body || '';
 
-    log(`✏️ Personalizing ${enrichedLeads.length} leads…`);
-    for (const lead of enrichedLeads) {
-      lead.personalization = await personalizeForLead(lead);
-      await sleep(2000);
-    }
+        if (!emailId || !bodyText || state.repliedEmails.has(fromEmail)) continue;
 
-    state.leads.push(...enrichedLeads.map(l => ({
-      ...l, addedAt: new Date().toISOString(), status: 'new', tags: ['apollo']
-    })));
+        const classification = await classifyReply(bodyText);
+        log(`📬 [${cfg.senderName}] ${fromEmail} → ${classification}`);
 
-    await pushToInstantly(enrichedLeads);
-    log(`🎉 Lead worker done — ${enrichedLeads.length} leads personalized and pushed to Instantly`);
+        if (classification !== 'interested') continue;
 
-  } finally {
-    state.leadWorkerRunning = false;
-  }
-}
+        // Build the calendar link
+        const calLink = cfg.calendarLink.startsWith('http') ? cfg.calendarLink : 'https://' + cfg.calendarLink;
 
-async function runReplyWorker() {
-  log('═══ Reply Worker starting ═══');
-  let replies;
-  try {
-    replies = await fetchInstantlyReplies();
-  } catch (e) {
-    log(`Reply fetch error: ${e.message}`, 'error');
-    return;
-  }
-  state.lastReplyPoll = new Date().toISOString();
-  if (!replies.length) { log('No new replies'); return; }
+        // Write reply AS this campaign's sender
+        const replyBody = await writeBookingReply(fromName, company, bodyText, calLink, cfg.senderName);
 
-  for (const reply of replies) {
-    const replyId   = reply.id;
-    const fromEmail = (reply.from_email || '').toLowerCase();
-    const fromName  = reply.from_name  || fromEmail.split('@')[0];
-    const bodyText  = reply.body || '';
-
-    if (state.seenReplyIds.includes(replyId) || state.blockedEmails.includes(fromEmail)) continue;
-    state.seenReplyIds.push(replyId);
-    state.stats.repliesRead++;
-
-    const { classification, confidence } = await classifyReply(bodyText);
-    log(`📩 ${fromName} <${fromEmail}> → ${classification} (${Math.round((confidence||0)*100)}%)`);
-
-    if (classification === 'Spam/Unsubscribe') {
-      state.blockedEmails.push(fromEmail);
-      await pauseLeadInInstantly(fromEmail);
-      state.stats.unsub++;
-    } else if (classification === 'Interested' && (confidence||0) >= 0.80 && state.autoReplyEnabled) {
-      const sent = await sendInstantlyReply(reply.email_id, reply.eaccount, buildAutoResponse('Interested'));
-      state.stats.interested++;
-      state.stats.autoSent++;
-      if (sent) log(`🎉 Booking link sent to ${fromName}!`, 'success');
-    } else if (classification === 'Interested') {
-      state.stats.interested++;
-      log(`⚑ ${fromName} interested but low confidence — flagged for manual review`);
-    } else if (state.autoReplyEnabled) {
-      const response = buildAutoResponse(classification);
-      if (response) {
-        await sendInstantlyReply(reply.email_id, reply.eaccount, response);
-        if (['Not Now', 'Not Interested', 'Out of Office'].includes(classification)) {
-          await pauseLeadInInstantly(fromEmail);
+        const sent = await sendReply(emailId, replyBody);
+        if (sent) {
+          state.repliedEmails.add(fromEmail);
+          state.stats.autoReplied++;
+          log(`✅ Auto-replied as "${cfg.senderName}" to ${fromEmail} → ${calLink}`, 'success');
         }
-        state.stats.autoSent++;
+
+        await sleep(1500);
       }
     }
+  } catch (e) {
+    log(`Reply worker error: ${e.message}`, 'error');
   }
-  if (state.seenReplyIds.length > 1000) state.seenReplyIds = state.seenReplyIds.slice(-1000);
+
+  state.workerRunning = false;
+  log('✅ Reply worker done');
 }
 
 // ════════════════════════════════════════════════════════════
-//  TIMERS
+//  API ROUTES
 // ════════════════════════════════════════════════════════════
-async function startWorkers() {
-  log('🚀 OutreachAI server started — Apollo + Claude + Instantly V2');
-  log(`Config check → Apollo:${!!CONFIG.APOLLO_KEY} | InstantlyV1:${!!CONFIG.INSTANTLY_KEY} | InstantlyV2:${!!CONFIG.INSTANTLY_KEY_V2} | Claude:${!!CONFIG.CLAUDE_KEY}`);
 
-  const runLeads = async () => {
-    try { await runLeadWorker(); } catch (e) { log('Lead worker crash: ' + e.message, 'error'); }
-    setTimeout(runLeads, 30 * 60 * 1000);
+app.get('/', (req, res) => res.json({ ok: true, service: 'outreachai-server', uptime: process.uptime(), stats: state.stats, lastPoll: state.lastPoll }));
+
+app.get('/api/health', (req, res) => res.json({
+  ok: true, service: 'outreachai-server', uptime: process.uptime(),
+  claudeConfigured: !!CONFIG.CLAUDE_KEY,
+  instantlyConfigured: !!CONFIG.INSTANTLY_KEY,
+  replyWorkerActive: !!CONFIG.INSTANTLY_KEY_V2,
+  campaignsRegistered: Object.keys(campaigns).length,
+}));
+
+app.get('/api/status', (req, res) => res.json({
+  ok: true, ...state.stats,
+  lastPoll: state.lastPoll,
+  workerRunning: state.workerRunning,
+  repliedCount: state.repliedEmails.size,
+  campaigns: Object.values(campaigns).map(c => ({ id: c.campaignId, name: c.name, senderName: c.senderName, hasCalendar: !!c.calendarLink })),
+}));
+
+app.get('/api/logs', (req, res) => res.json({ ok: true, logs: state.log.slice(0, 200) }));
+
+// ── Register / update a campaign
+// POST /api/campaigns
+// Body: { campaignId, name, senderName, calendarLink, instantlyKey (optional) }
+app.post('/api/campaigns', (req, res) => {
+  const { campaignId, name, senderName, calendarLink, instantlyKey } = req.body || {};
+  if (!campaignId || !senderName || !calendarLink) {
+    return res.status(400).json({ ok: false, error: 'campaignId, senderName, and calendarLink are required' });
+  }
+  campaigns[campaignId] = {
+    campaignId,
+    name:         name        || campaignId,
+    senderName:   senderName,
+    calendarLink: calendarLink,
+    instantlyKey: instantlyKey || CONFIG.INSTANTLY_KEY,
+    notes:        req.body.notes || '',
+    addedAt:      new Date().toISOString(),
   };
-  const runReplies = async () => {
-    try { await runReplyWorker(); } catch (e) { log('Reply worker crash: ' + e.message, 'error'); }
-    setTimeout(runReplies, CONFIG.POLL_INTERVAL_MS);
-  };
-
-  setTimeout(runLeads,   5000);
-  setTimeout(runReplies, 8000);
-}
-
-// ════════════════════════════════════════════════════════════
-//  API ROUTES — all return JSON, never HTML
-// ════════════════════════════════════════════════════════════
-
-// ── Health check
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, service: 'outreachai-server', uptime: process.uptime() });
+  saveCampaignsToDisk();
+  log(`Campaign registered: "${name}" → sender: ${senderName}, cal: ${calendarLink}`);
+  res.json({ ok: true, campaign: campaigns[campaignId] });
 });
 
-// ── Root (also returns JSON)
-app.get('/', (req, res) => {
-  res.json({
-    ok: true, service: 'outreachai-server', uptime: process.uptime(),
-    stats: state.stats,
-    lastApolloRun: state.lastApolloRun,
-    lastReplyPoll: state.lastReplyPoll,
-    apolloConfigured:      !!CONFIG.APOLLO_KEY,
-    claudeConfigured:      !!CONFIG.CLAUDE_KEY,
-    instantlyV1Configured: !!CONFIG.INSTANTLY_KEY,
-    instantlyV2Configured: !!CONFIG.INSTANTLY_KEY_V2,
-  });
+// ── Get all campaigns
+app.get('/api/campaigns', (req, res) => {
+  res.json({ ok: true, campaigns: Object.values(campaigns) });
 });
 
-// ── Status counters
-app.get('/api/status', (req, res) => {
-  res.json({
-    ok: true,
-    leadsFound:   state.stats.leadsFound,
-    enriched:     state.stats.enriched,
-    pushed:       state.stats.pushed,
-    repliesRead:  state.stats.repliesRead,
-    interested:   state.stats.interested,
-    autoSent:     state.stats.autoSent,
-    unsub:        state.stats.unsub,
-    personalized: state.stats.personalized,
-    lastApolloRun: state.lastApolloRun,
-    lastReplyPoll: state.lastReplyPoll,
-    leadWorkerRunning: state.leadWorkerRunning,
-  });
+// ── Delete a campaign
+app.delete('/api/campaigns/:id', (req, res) => {
+  const id = req.params.id;
+  if (campaigns[id]) { delete campaigns[id]; saveCampaignsToDisk(); res.json({ ok: true }); }
+  else res.status(404).json({ ok: false, error: 'Campaign not found' });
 });
 
-// ── Logs
-app.get('/api/logs', (req, res) => {
-  res.json({ ok: true, logs: state.log.slice(0, 200) });
-});
-
-// ── Full state
-app.get('/api/state', (req, res) => {
-  res.json({
-    ok: true,
-    leads: state.leads.slice(0, 200),
-    stats: state.stats,
-    log:   state.log.slice(0, 100),
-    blockedEmails:    state.blockedEmails,
-    lastApolloRun:    state.lastApolloRun,
-    lastReplyPoll:    state.lastReplyPoll,
-    autoReplyEnabled: state.autoReplyEnabled,
-  });
-});
-
-// ── Trigger lead fetch (POST)
-app.post('/api/leads/fetch', (req, res) => {
-  res.json({ ok: true, started: true, message: 'Apollo lead worker started' });
-  runLeadWorker().catch(e => log('Lead worker error: ' + e.message, 'error'));
-});
-
-// ── Trigger reply check (POST)
-app.post('/api/replies/check', (req, res) => {
-  res.json({ ok: true, started: true, message: 'Reply worker started' });
-  runReplyWorker().catch(e => log('Reply worker error: ' + e.message, 'error'));
-});
-
-// ── Test Apollo
-app.get('/api/apollo/test', async (req, res) => {
-  if (!CONFIG.APOLLO_KEY) return res.status(400).json({ ok: false, error: 'APOLLO_API_KEY not set' });
-  try {
-    const r = await fetch(`${APOLLO_BASE}/mixed_people/api_search`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Api-Key': CONFIG.APOLLO_KEY },
-      body:    JSON.stringify({ page: 1, per_page: 1, person_titles: ['ceo'], person_locations: ['United States'] }),
-    });
-    const d = await r.json();
-    if (r.ok) {
-      res.json({ ok: true, message: `Apollo connected — ${d.pagination?.total_entries || '?'} prospects available` });
-    } else {
-      res.status(r.status).json({ ok: false, error: d.message || JSON.stringify(d) });
-    }
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── Test Instantly V2
-app.get('/api/instantly/test', async (req, res) => {
-  const key = CONFIG.INSTANTLY_KEY_V2;
-  if (!key) return res.status(400).json({ ok: false, error: 'INSTANTLY_KEY_V2 not set in Render env vars' });
-  try {
-    const r        = await fetch(`${INSTANTLY_V2}/emails?limit=1`, {
-      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' }
-    });
-    const bodyText = await r.text();
-    if (r.ok) {
-      res.json({ ok: true, message: 'Instantly V2 connected', status: r.status });
-    } else {
-      res.status(r.status).json({ ok: false, status: r.status, error: bodyText });
-    }
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── Toggle auto-reply
-app.post('/api/autoreply/toggle', (req, res) => {
-  state.autoReplyEnabled = !state.autoReplyEnabled;
-  log(`Auto-reply ${state.autoReplyEnabled ? 'ENABLED' : 'DISABLED'}`);
-  res.json({ ok: true, autoReplyEnabled: state.autoReplyEnabled });
-});
-
-// ── Proxy Instantly (browser CORS fix)
-app.all('/api/proxy/instantly/*', async (req, res) => {
-  try {
-    const path    = req.params[0];
-    const isV2    = path.startsWith('v2/');
-    const baseUrl = isV2 ? 'https://api.instantly.ai/api' : INSTANTLY_V1;
-    const url     = `${baseUrl}/${path}`;
-    const headers = { 'Content-Type': 'application/json' };
-    if (isV2 && CONFIG.INSTANTLY_KEY_V2) headers['Authorization'] = `Bearer ${CONFIG.INSTANTLY_KEY_V2}`;
-    const r = await fetch(url, {
-      method: req.method, headers,
-      body: req.method !== 'GET' ? JSON.stringify(req.body) : undefined,
-    });
-    res.status(r.status).json(await r.json());
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── Unblock email
-app.post('/api/unblock', (req, res) => {
-  state.blockedEmails = state.blockedEmails.filter(e => e !== req.body.email);
-  res.json({ ok: true });
-});
-
-// ── Clear logs
-app.post('/api/log/clear', (req, res) => { state.log = []; res.json({ ok: true }); });
-
-
-// ════════════════════════════════════════════════════════════
-//  CSV IMPORT ROUTES
-// ════════════════════════════════════════════════════════════
-
-// Personalize a single lead via Claude
+// ── Personalize single lead
 app.post('/api/personalize', async (req, res) => {
   const { lead } = req.body || {};
-  if(!lead || !lead.first_name) return res.status(400).json({ ok: false, error: 'lead required' });
+  if (!lead || !lead.first_name) return res.status(400).json({ ok: false, error: 'lead with first_name required' });
   try {
     const personalization = await personalizeForLead(lead);
     res.json({ ok: true, personalization });
-  } catch(e) {
+  } catch (e) {
+    log(`/api/personalize error: ${e.message}`, 'error');
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Push a batch of pre-personalized CSV leads to Instantly
+// ── Push batch to Instantly
 app.post('/api/csv/push', async (req, res) => {
   const { leads, instantly_key, campaign_id } = req.body || {};
-  if(!leads || !leads.length) return res.status(400).json({ ok: false, error: 'leads array required' });
-
-  const iKey  = instantly_key  || CONFIG.INSTANTLY_KEY;
-  const iCamp = campaign_id    || CONFIG.INSTANTLY_CAMP;
-
-  // Cap at 2000 per call
-  const batch = leads.slice(0, 2000);
-  log(`[CSV Push] Pushing ${batch.length} leads to Instantly campaign ${iCamp}`);
-
+  if (!leads || !leads.length) return res.status(400).json({ ok: false, error: 'leads array required' });
+  const iKey  = instantly_key || CONFIG.INSTANTLY_KEY;
+  const iCamp = campaign_id   || CONFIG.INSTANTLY_CAMP;
+  if (!iKey)  return res.status(400).json({ ok: false, error: 'Instantly API key not set' });
+  if (!iCamp) return res.status(400).json({ ok: false, error: 'Instantly campaign ID not set' });
+  log(`[CSV Push] Pushing ${leads.length} leads to ${iCamp}`);
   try {
-    const r = await fetch(`${INSTANTLY_V1}/lead/add`, {
-      method:  'POST',
+    const r = await fetch(`${V1}/lead/add`, {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key:              iKey,
-        campaign_id:          iCamp,
-        skip_if_in_workspace: true,
-        leads:                batch,
-      }),
+      body: JSON.stringify({ api_key: iKey, campaign_id: iCamp, skip_if_in_workspace: true, leads: leads.slice(0, 2000) }),
     });
-    const bodyText = await r.text();
-    log(`[CSV Push] Instantly responded ${r.status}: ${bodyText.slice(0,200)}`);
-
-    if(r.ok){
-      state.stats.pushed += batch.length;
-      res.json({ ok: true, pushed: batch.length });
-    } else {
-      let errMsg = bodyText;
-      try { errMsg = JSON.parse(bodyText).error || bodyText; } catch(e) {}
-      res.status(r.status).json({ ok: false, error: errMsg, status: r.status });
-    }
-  } catch(e) {
-    log(`[CSV Push] Exception: ${e.message}`, 'error');
-    res.status(500).json({ ok: false, error: e.message });
-  }
+    const txt = await r.text();
+    if (r.ok) { state.stats.pushed += leads.length; res.json({ ok: true, pushed: leads.length }); }
+    else { let e = txt; try { e = JSON.parse(txt).error || txt; } catch {} res.status(r.status).json({ ok: false, error: e }); }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ── 404 catch-all — always JSON, never HTML
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: `Route not found: ${req.method} ${req.path}` });
+// ── Manually trigger reply check
+app.post('/api/replies/check', (req, res) => {
+  res.json({ ok: true, message: 'Reply worker triggered' });
+  replyWorker();
 });
+
+// ── Clear replied set
+app.post('/api/replies/reset', (req, res) => {
+  state.repliedEmails.clear();
+  res.json({ ok: true, message: 'Replied set cleared' });
+});
+
+// ── 404
+app.use((req, res) => res.status(404).json({ ok: false, error: `Not found: ${req.method} ${req.path}` }));
 
 // ════════════════════════════════════════════════════════════
 //  START
 // ════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`OutreachAI server running on port ${PORT}`);
-  startWorkers();
+  log(`🚀 OutreachAI server on port ${PORT}`);
+  log(`Claude: ${CONFIG.CLAUDE_KEY ? '✅' : '❌'}  V1: ${CONFIG.INSTANTLY_KEY ? '✅' : '❌'}  V2: ${CONFIG.INSTANTLY_KEY_V2 ? '✅' : '❌'}`);
+  log(`Default calendar: ${CONFIG.CALENDAR_LINK || '❌ not set'}`);
+
+  if (CONFIG.INSTANTLY_KEY_V2) {
+    log(`⏰ Reply worker — polling every ${CONFIG.POLL_INTERVAL_MS / 60000} min`);
+    replyWorker();
+    setInterval(replyWorker, CONFIG.POLL_INTERVAL_MS);
+  } else {
+    log('⚠️  Reply worker disabled — set INSTANTLY_KEY_V2 to enable', 'warn');
+  }
 });
