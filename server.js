@@ -404,6 +404,24 @@ app.post('/api/replies/reset', (req, res) => {
   res.json({ ok: true, message: 'Replied set cleared' });
 });
 
+// ── Test Instantly connection with any key (POST from dashboard, GET for default)
+app.all('/api/instantly/test', async (req, res) => {
+  const key = req.body?.instantly_key || CONFIG.INSTANTLY_KEY;
+  if (!key) return res.status(400).json({ ok: false, error: 'No Instantly key provided' });
+  try {
+    const r = await fetch(`${V1}/campaign/list?api_key=${key}&limit=1`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (r.ok) {
+      res.json({ ok: true, message: 'Instantly connected' });
+    } else {
+      const txt = await r.text();
+      let err = txt; try { err = JSON.parse(txt).error || txt; } catch {}
+      res.status(r.status).json({ ok: false, error: err });
+    }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // ── 404
 app.use((req, res) => res.status(404).json({ ok: false, error: `Not found: ${req.method} ${req.path}` }));
 
