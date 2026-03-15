@@ -81,63 +81,155 @@ function getCampaignCfg(campaignId) {
 }
 
 // ════════════════════════════════════════════════════════════
-//  HOMEPAGE FETCH
+//  RESEARCH — fetch and clean page text from any URL
 // ════════════════════════════════════════════════════════════
-async function fetchHomepageText(website) {
+async function fetchPageText(url, timeoutMs = 9000) {
   try {
-    let url = website.trim();
     if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
     const r = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; OutreachBot/1.0)' },
-      signal: AbortSignal.timeout(8000),
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      signal: AbortSignal.timeout(timeoutMs),
       redirect: 'follow',
     });
     if (!r.ok) return null;
     const html = await r.text();
-    return html
+    const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
       .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
       .replace(/\s{2,}/g, ' ')
-      .trim().slice(0, 3000) || null;
+      .trim();
+    return text.length > 50 ? text.slice(0, 3500) : null;
   } catch { return null; }
 }
 
 // ════════════════════════════════════════════════════════════
-//  CLAUDE — personalize opener
+//  RESEARCH — find best page to read about a company
+//  Priority: website → Google search → LinkedIn
+// ════════════════════════════════════════════════════════════
+async function researchCompany(lead) {
+  const company = lead.company || '';
+  const website = lead.website || '';
+
+  // 1. Try their website first
+  if (website) {
+    const text = await fetchPageText(website);
+    if (text) {
+      log(`🔍 Got website for ${company}`);
+      return { source: 'website', url: website, text };
+    }
+  }
+
+  // 2. Try Google search to find their site
+  if (company) {
+    try {
+      const query = encodeURIComponent(`${company} agency official site`);
+      const googleUrl = `https://www.google.com/search?q=${query}`;
+      const html = await fetch(googleUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+        signal: AbortSignal.timeout(7000),
+        redirect: 'follow',
+      }).then(r => r.ok ? r.text() : null).catch(() => null);
+
+      if (html) {
+        const urlMatch = html.match(/href="(https?:\/\/(?!www\.google)[^"&]+)"/);
+        if (urlMatch) {
+          const foundUrl = urlMatch[1];
+          const text = await fetchPageText(foundUrl);
+          if (text) {
+            log(`🔍 Found ${company} via Google: ${foundUrl}`);
+            return { source: 'google', url: foundUrl, text };
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Try LinkedIn company page
+  if (company) {
+    const linkedinSlug = company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const linkedinUrl = `https://www.linkedin.com/company/${linkedinSlug}/about/`;
+    const text = await fetchPageText(linkedinUrl, 8000);
+    if (text && text.length > 100) {
+      log(`🔍 Got LinkedIn for ${company}`);
+      return { source: 'linkedin', url: linkedinUrl, text };
+    }
+  }
+
+  log(`⚠️  No research found for ${company} — using name only`, 'warn');
+  return { source: 'none', url: '', text: null };
+}
+
+// ════════════════════════════════════════════════════════════
+//  CLAUDE — personalize opener with real research
 // ════════════════════════════════════════════════════════════
 async function personalizeForLead(lead) {
-  const fallback = `Hi ${lead.first_name}, noticed you run ${lead.company}.`;
+  const fallback = `Noticed ${lead.company} works with businesses on their marketing growth.`;
   if (!CONFIG.CLAUDE_KEY) return fallback;
 
-  const homepageText = lead.website ? await fetchHomepageText(lead.website) : null;
-  const ctx = homepageText
-    ? `Homepage content from ${lead.website}:\n"""\n${homepageText}\n"""`
-    : `No website available. Company name: ${lead.company}.`;
+  const research = await researchCompany(lead);
+
+  let ctx;
+  if (research.text) {
+    ctx = `Research source: ${research.source} (${research.url})\nContent:\n"""\n${research.text}\n"""`;
+  } else {
+    ctx = `No website or page found. Only known info: Company name is "${lead.company}". Contact: ${lead.first_name}, Title: ${lead.title || 'unknown'}.`;
+  }
+
+  const prompt = `You are writing the FIRST LINE of a cold email to ${lead.first_name} at ${lead.company}.
+
+${ctx}
+
+Your job: Write ONE ultra-specific opening line that proves you actually know what this company does.
+
+STRICT RULES:
+- Start with "Noticed" or "Saw" — do NOT start with "Hi" or "I"
+- Reference their SPECIFIC service, niche, client type, or methodology
+- Maximum 15 words total
+- FORBIDDEN: "I noticed you work at", "I came across", "I checked your website", "your company", "you run", "I visited"
+- Return ONLY the single line — no quotes, no punctuation at end
+
+GOOD examples:
+Noticed ELITE PPC focuses heavily on Google Ads for local service businesses.
+Saw BlueWing Impact runs SEO campaigns specifically for B2B SaaS companies.
+Noticed Thrive CRM helps marketing agencies automate their client onboarding.
+Saw Scaletopia places remote dev teams for Series A startups.
+
+BAD examples (never write these):
+Hi ${lead.first_name}, noticed you work at ${lead.company}.
+I noticed your company does marketing.
+Saw that you run ${lead.company}.`;
 
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(22000),
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 80,
-        messages: [{ role: 'user', content: `You are writing the opening line of a cold email to ${lead.first_name} at ${lead.company}.\n\n${ctx}\n\nWrite ONE short personalized opening line. Rules:\n- Start with "Hi ${lead.first_name},"\n- Mention what they specifically do\n- Maximum 15 words total\n- Do NOT say "I checked your website" or "I visited"\n- Be specific\n- Return ONLY the one line, no quotes\n\nExamples:\nHi Aaron, noticed BlueWing Impact focuses on SaaS SEO.\nHi Sarah, saw Thrive CRM helps agencies close more deals.` }],
+        max_tokens: 60,
+        messages: [{ role: 'user', content: prompt }],
       }),
-      signal: AbortSignal.timeout(20000),
     });
     const d = await r.json();
-    const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim().replace(/^["']|["'.,]$/g, '');
-    if (text && text.length > 10 && text.length < 150 && text.startsWith('Hi ')) {
+    const text = (d.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+      .trim()
+      .replace(/^["'`]|["'`.,]$/g, '')
+      .replace(/^(Hi\s+\w+,?\s*)/i, '');
+
+    if (text && text.length > 10 && text.length < 160) {
       state.stats.personalized++;
-      log(`✏️  ${lead.first_name} @ ${lead.company}: "${text}"`);
+      log(`✏️  ${lead.first_name} @ ${lead.company} [${research.source}]: "${text}"`);
       return text;
     }
   } catch (e) { log(`Personalization error: ${e.message}`, 'warn'); }
   return fallback;
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  CLAUDE — classify reply
